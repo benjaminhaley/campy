@@ -1,0 +1,77 @@
+# Campy — Engineering Guide
+
+This file is loaded automatically at the start of every Claude Code session in this repo. It is the source of truth for architecture and process decisions — read it before making structural changes, and update it whenever a decision below changes.
+
+For product background, goals, and development path, see `readme.md`. For running notes/findings, see `log.md`.
+
+## Product shape (MVP)
+- Two tabs: Events, Camps.
+- Public/anonymous: read-only access to both tabs.
+- Logged-in: can suggest new events/camps, attempt bookings. Suggestions are saved as `pending` and only appear on the public tabs once approved. Approval is modeled as a role, not a hardcoded person — Ben is the approver today, but the permission model must support automating or delegating approval (including to Claude) later without a schema change.
+- Admin (Ben only): full data access via the in-app admin panel (see Introspectability below).
+- Login: Facebook OAuth only for MVP. The auth layer must support adding more providers (Google, Apple) later without rearchitecture — Apple requires offering "Sign in with Apple" if we ever ship third-party social login inside an iOS App Store app.
+
+## Sharing
+- App-level sharing: a persistent, always-visible share action for inviting someone to Campy itself, with a QR code as the primary mechanism — built for local/in-person sharing (shown at pickup, scanned phone-to-phone). This is the growth/invite path, not a way to point someone at a specific listing.
+- Listing-level sharing (sending a specific camp/event to another user) is a separate mechanism, scoped to people who already have accounts, not a public link or QR code. Not part of MVP — design the data model so it can be added later, but don't build it now.
+
+## Platform strategy
+- Build a standard responsive mobile-web app first. No native app development until the web product is proven.
+- Native port path: Capacitor wraps the built web app into iOS/Android binaries with no rewrite. Native device APIs (push, camera, etc.) get added later via Capacitor plugins, only when actually needed.
+- Design for one viewport class: vertical phone. Desktop/tablet layout is not a design goal — don't spend effort on it.
+- Performance target: usable on a slow/unreliable connection (phone at a park, not a desk). Cache last-fetched events/camps client-side so the app isn't blank on a slow request.
+
+## Design system
+- Ionic component library (React bindings), forced into Material Design mode on every platform (iOS, Android, web) — do NOT use Ionic's default per-platform adaptive styling. The goal is visually identical interfaces everywhere, not a native-feeling-per-OS look.
+- Use Ionic's built-in components (tab bar, lists, forms, modals, cards) rather than custom-built equivalents. Don't hand-roll UI primitives Ionic already provides — that's how design drifts into haphazard territory.
+
+## Application architecture
+- Single repo, single Postgres database, single Node/TypeScript API server. Don't split services or add databases without a strong, explicit reason.
+- Frontend: Ionic React + Vite, TypeScript strict mode.
+- Backend: Node.js API server (Fastify), TypeScript strict mode.
+- ORM: Drizzle (schema-as-TypeScript, close to raw SQL) — chosen partly because its transparency makes it straightforward to build a generic DB browser directly off the schema.
+- Hosting: Railway. The deciding criterion is API/introspection access for Claude, not dashboard ease-of-use for Ben — Railway ships a local MCP server, a hosted remote MCP server (mcp.railway.com), and an agent-oriented CLI, so I can deploy, inspect logs, and manage the database directly instead of working around a plain REST API. Railway also added Postgres PITR (Pro tier, ~7-day WAL-archive window), closing the backup gap that used to favor Render. Accepted trade-off: Railway has no free tier and a weaker 2025-2026 reliability record than Render — fine at this stage, worth revisiting if uptime becomes business-critical. Fly.io stays ruled out (deprecated unmanaged Postgres, heavier Dockerfile-based deploy).
+- API conventions: REST modeled on Stripe's API design — plural resource-based URLs, standard HTTP verbs, one consistent error-object shape, cursor-based pagination. Chosen because it's a widely-known, well-documented reference standard rather than something invented per feature.
+- Database naming: snake_case, plural table names, UUID primary keys, `created_at`/`updated_at`/`deleted_at` on every table, singular `_id` foreign key columns. Standard Rails-derived convention; pairs directly with Drizzle's schema style.
+- File organization: feature-based (vertical-slice), not layer-based — code for `events`, `camps`, `auth`, `admin`, etc. is colocated (routes, db access, components, tests together) rather than spread across parallel `routes/`, `models/`, `components/` trees. Makes a whole dead feature visible as one unused folder instead of scattered orphaned files (see Code hygiene below).
+
+## Local development
+- The full stack runs locally with one command (Postgres via docker-compose + the API/frontend dev servers). Tests always run against this local database, never against the Railway production database — the day-to-day test loop must not depend on cloud access or risk touching real data.
+- Schema changes go through Drizzle Kit migrations checked into the repo. Never hand-edit the schema directly against any database — this keeps the schema, the admin table-browser, and the codebase from drifting apart.
+
+## Data safety & classification
+- Public (no login): service/business listings only — camp and event details (name, schedule, price, location, description). No personal data about any individual is ever publicly queryable.
+- Private (login required): anything that is personal data about a person — user accounts, babysitter profiles/contact info, booking details, kids' names/ages/health info. Standard PII least-privilege applies: a user sees their own data and what's needed for an active transaction. Broader visibility for social proof (e.g. "who from school is going," per `readme.md`) is a deliberate feature but must expose attendance signals only, never raw contact/health/PII fields.
+- Admin (Ben) can see all of the above via the in-app admin panel, for support/moderation.
+- Secrets (DB URL, Facebook app secret, session secret, etc.) live in a gitignored `.env`; a checked-in `.env.example` documents every required variable. Never commit secrets.
+- Payment info is never stored directly in our database — booking payments are delegated to a processor (e.g. Stripe) and we store only tokens/references, not raw card data. This is a hard rule to apply from the first line of booking code, not a retrofit.
+
+## Data recoverability & Claude's production-database boundary
+- Nothing is ever hard-deleted from application code: deletes set a `deleted_at` timestamp (soft-delete) rather than issuing SQL `DELETE`, so in-app mistakes are always reversible.
+- Every mutation and deletion is also captured in `events_log` (actor, action, metadata, timestamp) — an audit trail independent of the row itself.
+- Railway Postgres PITR (opt-in, ~7-day WAL-archive window) is the infra-level safety net underneath both of the above, for catastrophic cases (bad migration, bug) that soft-deletes don't cover.
+- Local database: fully self-serve — migrate, seed, reset freely without asking.
+- Railway production database: any schema migration or hard data deletion requires Ben's explicit go-ahead first, every time, once real (family/user) data exists there. This is stricter than the general Claude Code safety defaults because the data involved is about real kids, not just code.
+
+## Testing (must run headless — no manual QA step required)
+- Unit/component: Vitest + React Testing Library.
+- E2E: Playwright, headless, using its built-in mobile-viewport device emulation profiles. Reporters written to disk (JSON/HTML) so failures are inspectable without a live browser or user involvement.
+- Types: TypeScript strict mode everywhere — treat `tsc` errors as test failures.
+- Every push runs lint + typecheck + unit + e2e in CI (GitHub Actions); this must pass before merge. A local pre-push hook runs the fast subset.
+- Coverage is enforced but targeted: near-100% required on business logic (bookings, auth, data mutations); light coverage is acceptable on trivial UI glue. Don't chase a blanket coverage percentage for its own sake — that produces padding, not protection.
+
+## Introspectability
+- No separate admin tool (no pgAdmin/Supabase Studio/etc. as the primary interface). All DB browsing, logs, and analytics live in an in-app `/admin` section gated to Ben's account specifically (not just "logged in").
+- Logs are structured domain events, not verbose request/polling logs: a single `events_log` table (actor, action, metadata JSON, timestamp) capturing discrete events like "user created," "camp submitted," "booking attempted."
+- Exception: production error/crash monitoring (stack traces, alerting) uses an external tool (Sentry or similar) rather than being built in-house. This is a rare-use ops tool, not a daily-use surface, so duplicating it isn't worth the effort — it doesn't violate the "everything on the site" rule, which is about the tools Ben uses day to day.
+
+## Code hygiene (anti-sprawl)
+- Knip runs in CI on every push, flagging unused exports, unused files, and unused dependencies automatically — dead-code detection isn't a manual, remember-to-do-it process.
+- ESLint enforces unused-imports/unused-vars rules at write time, so cruft doesn't accumulate between cleanup passes.
+- Feature-based file organization (see Application architecture) makes a whole dead feature visible as one unused folder rather than scattered orphaned files spread across shared layers.
+- Run the `/simplify` skill as a standard step before merging non-trivial work — a deliberate pass reviewing the changed code for reuse, redundancy, and unnecessary complexity, not an occasional nice-to-have.
+
+## Status of these decisions
+Confirmed with Ben (2026-07-23): Capacitor for the native port, Ionic forced-Material design system, Sentry-as-exception for error tracking, Railway for hosting (agent API/MCP access as the deciding criterion), public-listings/private-PII data classification, pending-review queue with a generalizable approver role, soft-delete + audit-log + PITR recoverability model, confirm-first requirement for production DB migrations/deletions, Stripe-style API conventions, Rails-style DB naming, feature-based file organization, QR-code app-invite sharing (distinct from a not-yet-built account-scoped listing-sharing mechanism), and knip + `/simplify` as the anti-sprawl mechanism.
+
+Proposed by Claude, not yet explicitly confirmed: Fastify, Drizzle, Vitest/Playwright, `events_log` exact schema, coverage philosophy, docker-compose local dev setup, knip/ESLint exact config. Treat these as the working default, but they're open to change — this file should stay current, not aspirational. When a decision here changes, update this file in the same commit as the change.
